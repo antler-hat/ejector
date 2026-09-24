@@ -95,7 +95,11 @@ final class VolumeManager {
                     if components.count >= 2 {
                         let processName = components[0]
                         if let pid = Int(components[1]) {
-                            let process = ProcessInfo(name: processName, pid: pid)
+                            let process = ProcessInfo(
+                                name: processName,
+                                pid: pid,
+                                startedAt: processStartTime(for: pid)
+                            )
                             if !result.contains(where: { $0.pid == pid }) {
                                 result.append(process)
                             }
@@ -159,15 +163,46 @@ final class VolumeManager {
 
     func terminate(processes: [ProcessInfo]) {
         for process in processes {
+            guard isCurrent(process) else { continue }
+
             let task = Process()
             task.launchPath = "/bin/kill"
-            task.arguments = ["-9", String(process.pid)]
+            task.arguments = ["-TERM", String(process.pid)]
             do {
                 try task.run()
                 task.waitUntilExit()
             } catch {
                 continue
             }
+        }
+    }
+
+    func isCurrent(_ process: ProcessInfo) -> Bool {
+        guard let startedAt = process.startedAt else { return false }
+        return processStartTime(for: process.pid) == startedAt
+    }
+
+    func processStartTime(for pid: Int) -> String? {
+        let task = Process()
+        task.launchPath = "/bin/ps"
+        task.arguments = ["-p", String(pid), "-o", "lstart="]
+        let pipe = Pipe()
+        task.standardOutput = pipe
+
+        do {
+            try task.run()
+            task.waitUntilExit()
+            let data = pipe.fileHandleForReading.readDataToEndOfFile()
+            guard task.terminationStatus == 0,
+                  let value = String(data: data, encoding: .utf8)?
+                    .trimmingCharacters(in: .whitespacesAndNewlines),
+                  !value.isEmpty
+            else {
+                return nil
+            }
+            return value
+        } catch {
+            return nil
         }
     }
 
