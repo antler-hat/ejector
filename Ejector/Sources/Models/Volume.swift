@@ -25,4 +25,11 @@ struct ProcessDescriptor {
 struct ProcessInfo {
     let name: String
     let pid: Int
+    let startedAt: String?
+
+    init(name: String, pid: Int, startedAt: String? = nil) {
+        self.name = name
+        self.pid = pid
+        self.startedAt = startedAt
+    }
 }

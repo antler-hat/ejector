@@ -78,6 +78,7 @@ final class VolumeManager {
 
     func findProcessesUsingVolume(_ volume: Volume) -> [ProcessInfo] {
         var result: [ProcessInfo] = []
+        var seenPIDs: Set<Int> = []
         let task = Process()
         task.launchPath = "/usr/sbin/lsof"
         task.arguments = ["+f", "--", volume.path]
@@ -94,11 +95,13 @@ final class VolumeManager {
                     let components = line.components(separatedBy: " ").filter { !$0.isEmpty }
                     if components.count >= 2 {
                         let processName = components[0]
-                        if let pid = Int(components[1]) {
-                            let process = ProcessInfo(name: processName, pid: pid)
-                            if !result.contains(where: { $0.pid == pid }) {
-                                result.append(process)
-                            }
+                        if let pid = Int(components[1]), seenPIDs.insert(pid).inserted {
+                            let process = ProcessInfo(
+                                name: processName,
+                                pid: pid,
+                                startedAt: processStartTime(for: pid)
+                            )
+                            result.append(process)
                         }
                     }
                 }
@@ -157,17 +160,80 @@ final class VolumeManager {
         }
     }
 
-    func terminate(processes: [ProcessInfo]) {
-        for process in processes {
-            let task = Process()
-            task.launchPath = "/bin/kill"
-            task.arguments = ["-9", String(process.pid)]
-            do {
-                try task.run()
-                task.waitUntilExit()
-            } catch {
-                continue
+    func terminate(
+        processes: [ProcessInfo],
+        gracefulTimeout: TimeInterval = 2.0,
+        forcedTimeout: TimeInterval = 1.0
+    ) {
+        var processesByPID: [Int: ProcessInfo] = [:]
+        for process in processes where processesByPID[process.pid] == nil && isCurrent(process) {
+            processesByPID[process.pid] = process
+        }
+
+        var remaining = processesByPID.values.filter { sendSignal("-TERM", to: $0) }
+        remaining = waitForExit(of: remaining, timeout: gracefulTimeout)
+
+        // A process may ignore TERM. Revalidate its identity before forcefully ending it
+        // so a recycled PID can never receive KILL.
+        remaining = remaining.filter { isCurrent($0) && sendSignal("-KILL", to: $0) }
+        _ = waitForExit(of: remaining, timeout: forcedTimeout)
+    }
+
+    private func sendSignal(_ signal: String, to process: ProcessInfo) -> Bool {
+        let task = Process()
+        task.launchPath = "/bin/kill"
+        task.arguments = [signal, String(process.pid)]
+        do {
+            try task.run()
+            task.waitUntilExit()
+            return task.terminationStatus == 0
+        } catch {
+            return false
+        }
+    }
+
+    private func waitForExit(
+        of processes: [ProcessInfo],
+        timeout: TimeInterval,
+        pollInterval: TimeInterval = 0.1
+    ) -> [ProcessInfo] {
+        var remaining = processes.filter(isCurrent)
+        let deadline = Date().addingTimeInterval(max(0, timeout))
+
+        while !remaining.isEmpty && Date() < deadline {
+            Thread.sleep(forTimeInterval: min(pollInterval, max(0, deadline.timeIntervalSinceNow)))
+            remaining = remaining.filter(isCurrent)
+        }
+
+        return remaining
+    }
+
+    func isCurrent(_ process: ProcessInfo) -> Bool {
+        guard let startedAt = process.startedAt else { return false }
+        return processStartTime(for: process.pid) == startedAt
+    }
+
+    func processStartTime(for pid: Int) -> String? {
+        let task = Process()
+        task.launchPath = "/bin/ps"
+        task.arguments = ["-p", String(pid), "-o", "lstart="]
+        let pipe = Pipe()
+        task.standardOutput = pipe
+
+        do {
+            try task.run()
+            task.waitUntilExit()
+            let data = pipe.fileHandleForReading.readDataToEndOfFile()
+            guard task.terminationStatus == 0,
+                  let value = String(data: data, encoding: .utf8)?
+                    .trimmingCharacters(in: .whitespacesAndNewlines),
+                  !value.isEmpty
+            else {
+                return nil
             }
+            return value
+        } catch {
+            return nil
         }
     }
 
