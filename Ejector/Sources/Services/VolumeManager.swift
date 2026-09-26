@@ -80,7 +80,7 @@ final class VolumeManager {
         var result: [ProcessInfo] = []
         let task = Process()
         task.launchPath = "/usr/sbin/lsof"
-        task.arguments = [volume.path]
+        task.arguments = ["+f", "--", volume.path]
         let pipe = Pipe()
         task.standardOutput = pipe
 
