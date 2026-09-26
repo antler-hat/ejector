@@ -78,6 +78,7 @@ final class VolumeManager {
 
     func findProcessesUsingVolume(_ volume: Volume) -> [ProcessInfo] {
         var result: [ProcessInfo] = []
+        var seenPIDs: Set<Int> = []
         let task = Process()
         task.launchPath = "/usr/sbin/lsof"
         task.arguments = [volume.path]
@@ -94,15 +95,13 @@ final class VolumeManager {
                     let components = line.components(separatedBy: " ").filter { !$0.isEmpty }
                     if components.count >= 2 {
                         let processName = components[0]
-                        if let pid = Int(components[1]) {
+                        if let pid = Int(components[1]), seenPIDs.insert(pid).inserted {
                             let process = ProcessInfo(
                                 name: processName,
                                 pid: pid,
                                 startedAt: processStartTime(for: pid)
                             )
-                            if !result.contains(where: { $0.pid == pid }) {
-                                result.append(process)
-                            }
+                            result.append(process)
                         }
                     }
                 }
@@ -161,20 +160,52 @@ final class VolumeManager {
         }
     }
 
-    func terminate(processes: [ProcessInfo]) {
-        for process in processes {
-            guard isCurrent(process) else { continue }
-
-            let task = Process()
-            task.launchPath = "/bin/kill"
-            task.arguments = ["-TERM", String(process.pid)]
-            do {
-                try task.run()
-                task.waitUntilExit()
-            } catch {
-                continue
-            }
+    func terminate(
+        processes: [ProcessInfo],
+        gracefulTimeout: TimeInterval = 2.0,
+        forcedTimeout: TimeInterval = 1.0
+    ) {
+        var processesByPID: [Int: ProcessInfo] = [:]
+        for process in processes where processesByPID[process.pid] == nil && isCurrent(process) {
+            processesByPID[process.pid] = process
         }
+
+        var remaining = processesByPID.values.filter { sendSignal("-TERM", to: $0) }
+        remaining = waitForExit(of: remaining, timeout: gracefulTimeout)
+
+        // A process may ignore TERM. Revalidate its identity before forcefully ending it
+        // so a recycled PID can never receive KILL.
+        remaining = remaining.filter { isCurrent($0) && sendSignal("-KILL", to: $0) }
+        _ = waitForExit(of: remaining, timeout: forcedTimeout)
+    }
+
+    private func sendSignal(_ signal: String, to process: ProcessInfo) -> Bool {
+        let task = Process()
+        task.launchPath = "/bin/kill"
+        task.arguments = [signal, String(process.pid)]
+        do {
+            try task.run()
+            task.waitUntilExit()
+            return task.terminationStatus == 0
+        } catch {
+            return false
+        }
+    }
+
+    private func waitForExit(
+        of processes: [ProcessInfo],
+        timeout: TimeInterval,
+        pollInterval: TimeInterval = 0.1
+    ) -> [ProcessInfo] {
+        var remaining = processes.filter(isCurrent)
+        let deadline = Date().addingTimeInterval(max(0, timeout))
+
+        while !remaining.isEmpty && Date() < deadline {
+            Thread.sleep(forTimeInterval: min(pollInterval, max(0, deadline.timeIntervalSinceNow)))
+            remaining = remaining.filter(isCurrent)
+        }
+
+        return remaining
     }
 
     func isCurrent(_ process: ProcessInfo) -> Bool {
